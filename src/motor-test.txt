@@ -1,19 +1,3 @@
-/*
- * NEMA 17 x2 + A4988 + CNC Shield v3 — Two Motor Back & Forth
- * Board  : NUCLEO-F446RE (STM32duino / PlatformIO)
- * MS1+MS2+MS3 all shorted → 1/16 microstepping → 3200 steps/rev
- *
- * Motor 1 → X slot on CNC shield  (no changes)
- * Motor 2 → Z slot on CNC shield  (use Z instead of Y — avoids D3/PB3 conflict)
- *
- * Pin assignments:
- *   X STEP → D2  (PA10)   X DIR → D5 (PB4)
- *   Z STEP → D4  (PB5)    Z DIR → D7 (PA8)
- *   EN     → D8  (PA9)    shared, active LOW
- *
- * No jumper wires needed — plug motors into X and Z slots directly.
- */
-
 #include <Arduino.h>
 
 #define X_STEP_PIN      2   // D2  → PA10

@@ -1,9 +1,3 @@
-/*
- * ICM-20948 TILT → MOTOR DIRECTION (DEBUG VERSION)
- * ICM address: 0x69 (ADA → 3.3V)
- * X slot → Motor 1 | Z slot → Motor 2
- */
-
 #include <Arduino.h>
 #include <Wire.h>
 
