@@ -1,0 +1,309 @@
+/*
+ * =====================================================================
+ * BalancingWii_STM32 – ULTRA SOFT (for hardware limit)
+ * =====================================================================
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// ======================== HARDWARE PINS ============================
+#define X_STEP_PIN   2
+#define X_DIR_PIN    5
+#define Z_STEP_PIN   4
+#define Z_DIR_PIN    7
+#define EN_PIN       8
+#define LED_PIN      LED_BUILTIN
+
+// ======================== ICM-20948 I2C ============================
+#define ICM_ADDR     0x69
+#define ICM_BANK_SEL 0x7F
+
+// ======================== ULTRA SOFT GAINS ========================
+float SPEED_P = 0.15f;   // very low speed response
+float SPEED_I = 0.01f;   // minimal integral
+float ANGLE_P = 18.0f;   // much lower to prevent oscillation
+float ANGLE_D = 12.0f;   // high damping
+float balanceAngleOffset = 2.0f;  // keep offset
+
+#define MAX_SPEED          1500
+#define MAX_TARGET_ANGLE   150
+#define MAX_STEERING       90
+#define SPEED_IMAX         20000
+
+#define RISE_SPEED_K       1.0f
+#define FALL_ANGLE         70.0f
+
+#define LOOP_PERIOD_US     5000
+#define CF_ALPHA           0.98f
+#define GYRO_LPF_ALPHA     0.15f
+
+#define MIN_STEP_DELAY     100
+#define MAX_STEP_DELAY     3000
+#define SPEED_SCALE        100.0f
+#define MAX_STEPS_PER_TICK 20
+#define ANGLE_DEAD_ZONE    2.0f   // larger dead zone
+
+// ======================== GLOBAL VARIABLES =========================
+float angle = 0.0f;
+float gyroBiasX = 0.0f, gyroBiasY = 0.0f;
+int tiltAxis = 1;
+float gyroFiltered = 0.0f;
+
+float actualSpeed = 0.0f;
+float targetSpeed = 0.0f;
+float steering   = 0.0f;
+float speedIntegral = 0.0f;
+float positionError = 0.0f;
+float angleSetpoint = 0.0f;
+float outputSpeed = 0.0f;
+
+bool motorDir = true;
+int dirHoldCnt = 0;
+#define DIR_HOLD_TICKS 4
+
+bool riseModeEnabled = true;
+uint8_t risePhase = 2;
+float riseSpeed = 0.0f;
+
+// ======================== ICM FUNCTIONS ============================
+static void icmBank(uint8_t b) {
+    Wire.beginTransmission(ICM_ADDR);
+    Wire.write(ICM_BANK_SEL);
+    Wire.write((b & 0x03) << 4);
+    Wire.endTransmission();
+}
+static void icmWrite(uint8_t bank, uint8_t reg, uint8_t val) {
+    icmBank(bank);
+    Wire.beginTransmission(ICM_ADDR);
+    Wire.write(reg); Wire.write(val);
+    Wire.endTransmission();
+}
+static uint8_t icmRead(uint8_t bank, uint8_t reg) {
+    icmBank(bank);
+    Wire.beginTransmission(ICM_ADDR);
+    Wire.write(reg);
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)ICM_ADDR, (uint8_t)1);
+    return Wire.available() ? Wire.read() : 0xFF;
+}
+static void icmReadAll(float &ax, float &ay, float &az,
+                       float &gx, float &gy, float &gz) {
+    icmBank(0);
+    Wire.beginTransmission(ICM_ADDR);
+    Wire.write(0x2D);
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)ICM_ADDR, (uint8_t)12);
+    uint8_t b[12] = {};
+    for (int i = 0; i < 12 && Wire.available(); ++i) b[i] = Wire.read();
+    ax = (int16_t)((b[0] << 8) | b[1]) / 16384.0f;
+    ay = (int16_t)((b[2] << 8) | b[3]) / 16384.0f;
+    az = (int16_t)((b[4] << 8) | b[5]) / 16384.0f;
+    gx = (int16_t)((b[6] << 8) | b[7]) / 131.0f;
+    gy = (int16_t)((b[8] << 8) | b[9]) / 131.0f;
+    gz = (int16_t)((b[10]<< 8) | b[11]) / 131.0f;
+}
+
+// ======================== STEPPER =================================
+static inline void stepMotors(bool forward) {
+    digitalWrite(X_DIR_PIN, forward ? LOW : HIGH);
+    digitalWrite(Z_DIR_PIN, forward ? HIGH : LOW);
+    delayMicroseconds(2);
+    digitalWrite(X_STEP_PIN, HIGH);
+    digitalWrite(Z_STEP_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(X_STEP_PIN, LOW);
+    digitalWrite(Z_STEP_PIN, LOW);
+}
+
+// ======================== SERIAL COMMANDS ==========================
+static void parseSerialCommand() {
+    if (!Serial.available()) return;
+    char c = Serial.read();
+    float val = Serial.parseFloat();
+    switch (c) {
+        case 'p': ANGLE_P = val; break;
+        case 'd': ANGLE_D = val; break;
+        case 's': SPEED_P = val; break;
+        case 'i': SPEED_I = val; break;
+        case 'o': balanceAngleOffset = val; break;
+        case 'f': targetSpeed = constrain(val, -MAX_SPEED, MAX_SPEED); break;
+        case 'b': targetSpeed = constrain(-val, -MAX_SPEED, MAX_SPEED); break;
+        case 't': steering = constrain(val, -MAX_STEERING, MAX_STEERING); break;
+        case 'r': speedIntegral = 0; positionError = 0; break;
+        default: break;
+    }
+}
+
+// ======================== SETUP ====================================
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial.println(F("\n=== BalancingWii ULTRA SOFT ==="));
+    Serial.println(F("Use 'o' to adjust offset, 'p'/'d' for gains."));
+
+    const uint8_t pins[] = {X_STEP_PIN, X_DIR_PIN, Z_STEP_PIN, Z_DIR_PIN, EN_PIN, LED_PIN};
+    for (uint8_t p : pins) pinMode(p, OUTPUT);
+    digitalWrite(X_STEP_PIN, LOW); digitalWrite(X_DIR_PIN, LOW);
+    digitalWrite(Z_STEP_PIN, LOW); digitalWrite(Z_DIR_PIN, LOW);
+    digitalWrite(EN_PIN, HIGH); digitalWrite(LED_PIN, LOW);
+
+    Wire.begin(); Wire.setClock(400000); delay(200);
+    uint8_t who = icmRead(0, 0x00);
+    Serial.print(F("WHO_AM_I: 0x")); Serial.println(who, HEX);
+    if (who != 0xEA) {
+        Serial.println(F("ICM-20948 not found!"));
+        while (1) { digitalWrite(LED_PIN, HIGH); delay(150); digitalWrite(LED_PIN, LOW); delay(150); }
+    }
+    icmWrite(0, 0x06, 0x01); delay(50);
+    icmWrite(0, 0x07, 0x00); delay(20);
+
+    Serial.println(F("Hold robot STILL and UPRIGHT for 3 seconds..."));
+    float sumGX = 0, sumGY = 0, sumAX = 0, sumAY = 0;
+    int samples = 0;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 3000) {
+        digitalWrite(LED_PIN, (millis() % 200 < 100) ? HIGH : LOW);
+        float ax, ay, az, gx, gy, gz;
+        icmReadAll(ax, ay, az, gx, gy, gz);
+        sumGX += gx; sumGY += gy;
+        sumAX += ax; sumAY += ay;
+        samples++;
+        delay(10);
+    }
+    digitalWrite(LED_PIN, HIGH);
+
+    gyroBiasX = sumGX / samples;
+    gyroBiasY = sumGY / samples;
+    tiltAxis = 1;
+    Serial.print(F("Tilt axis: Y (accel-Y / gyro-X)\n"));
+    Serial.print(F("Gyro bias X: ")); Serial.print(gyroBiasX, 3);
+    Serial.print(F("   Y: ")); Serial.println(gyroBiasY, 3);
+
+    float ax, ay, az, gx, gy, gz;
+    icmReadAll(ax, ay, az, gx, gy, gz);
+    angle = atan2f(ay, az) * 180.0f / PI;
+    Serial.print(F("Initial angle: ")); Serial.print(angle, 2); Serial.println(F(" deg"));
+
+    Serial.println(F("\n--- DIRECTION TEST ---"));
+    Serial.println(F("Robot will move FORWARD for 1 second, then BACKWARD."));
+    digitalWrite(EN_PIN, LOW);
+    for (int i = 0; i < 100; i++) { stepMotors(true); delayMicroseconds(2000); }
+    delay(1000);
+    for (int i = 0; i < 100; i++) { stepMotors(false); delayMicroseconds(2000); }
+    delay(500);
+    Serial.println(F("Direction test complete. Now balancing...\n"));
+    Serial.println(F("  angle | target | speed | stepCnt | dir | delay | offset"));
+    Serial.println(F(  "  ------+--------+-------+---------+-----+-------+-------"));
+}
+
+// ======================== MAIN LOOP ================================
+void loop() {
+    static unsigned long loopTimer = 0;
+    while (micros() - loopTimer < LOOP_PERIOD_US) {}
+    loopTimer = micros();
+
+    parseSerialCommand();
+
+    float ax, ay, az, gx, gy, gz;
+    icmReadAll(ax, ay, az, gx, gy, gz);
+
+    float accelAngle = atan2f(ay, az) * 180.0f / PI;
+    float gyroRaw = gx - gyroBiasX;
+
+    gyroFiltered = GYRO_LPF_ALPHA * gyroRaw + (1.0f - GYRO_LPF_ALPHA) * gyroFiltered;
+    angle = CF_ALPHA * (angle + gyroFiltered * (LOOP_PERIOD_US / 1e6f))
+            + (1.0f - CF_ALPHA) * accelAngle;
+
+    if (fabs(angle) > FALL_ANGLE) {
+        digitalWrite(EN_PIN, HIGH);
+        digitalWrite(LED_PIN, LOW);
+        speedIntegral = 0;
+        outputSpeed = 0;
+        risePhase = 2;
+        riseSpeed = 0;
+        return;
+    }
+    digitalWrite(EN_PIN, LOW);
+    digitalWrite(LED_PIN, HIGH);
+
+    if (fabs(targetSpeed) < 15 && fabs(steering) < 15) {
+        positionError += actualSpeed * (LOOP_PERIOD_US / 1e6f);
+    } else {
+        positionError = 0.0f;
+    }
+
+    actualSpeed = 0.92f * actualSpeed + 0.08f * outputSpeed;
+    float speedError = targetSpeed - actualSpeed - (positionError * 0.01f);
+    speedIntegral = constrain(speedIntegral + speedError * (LOOP_PERIOD_US / 1e6f) * SPEED_I,
+                              -SPEED_IMAX, SPEED_IMAX);
+    angleSetpoint = constrain(SPEED_P * speedError + speedIntegral, -MAX_TARGET_ANGLE, MAX_TARGET_ANGLE);
+
+    if (riseModeEnabled && fabs(angle) > 25.0f && fabs(angle) < FALL_ANGLE) {
+        if (risePhase == 0) {
+            riseSpeed = constrain(riseSpeed + 0.7f * RISE_SPEED_K, 0, 140);
+            outputSpeed = (angle > 0) ? riseSpeed : -riseSpeed;
+            steering = 0;
+            if (riseSpeed >= 140) { riseSpeed = 0; risePhase = 1; }
+        } else if (risePhase == 1) {
+            riseSpeed = constrain(riseSpeed + 0.85f * RISE_SPEED_K, 0, 100);
+            outputSpeed = (angle > 0) ? -riseSpeed : riseSpeed;
+            steering = 0;
+            if (riseSpeed >= 100) risePhase = 2;
+        } else {
+            riseSpeed = 0;
+            outputSpeed = 0;
+        }
+    } else {
+        risePhase = 0;
+    }
+
+    // **** APPLY OFFSET ****
+    float correctedAngle = angle - balanceAngleOffset;
+    float angleError = angleSetpoint - correctedAngle;
+    if (fabs(angleError) < ANGLE_DEAD_ZONE) angleError = 0;
+
+    float acceleration = ANGLE_P * angleError - ANGLE_D * gyroFiltered;
+    if (risePhase != 2) {
+        outputSpeed += acceleration * (LOOP_PERIOD_US / 1e6f);
+        outputSpeed = constrain(outputSpeed, -MAX_SPEED, MAX_SPEED);
+    }
+
+    int16_t leftSpeed  = (int16_t)(-outputSpeed + steering);
+    int16_t rightSpeed = (int16_t)( outputSpeed + steering);
+    leftSpeed  = constrain(leftSpeed,  -MAX_SPEED, MAX_SPEED);
+    rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+
+    float avgSpeed = (fabs(leftSpeed) + fabs(rightSpeed)) / 2.0f;
+    bool wantFwd = (outputSpeed > 0);
+
+    if (wantFwd != motorDir) {
+        if (++dirHoldCnt >= DIR_HOLD_TICKS) { motorDir = wantFwd; dirHoldCnt = 0; }
+    } else {
+        dirHoldCnt = 0;
+    }
+
+    int stepsThisTick = 0;
+    int stepDelay = MAX_STEP_DELAY;
+    if (avgSpeed > 1.0f) {
+        stepDelay = MAX_STEP_DELAY - (int)(avgSpeed * SPEED_SCALE);
+        stepDelay = constrain(stepDelay, MIN_STEP_DELAY, MAX_STEP_DELAY);
+        stepsThisTick = constrain((int)(LOOP_PERIOD_US / (stepDelay + 12)), 0, MAX_STEPS_PER_TICK);
+        for (int i = 0; i < stepsThisTick; ++i) {
+            stepMotors(motorDir);
+            delayMicroseconds(stepDelay);
+        }
+    }
+
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 100) {
+        Serial.print(angle, 1);    Serial.print(F(" | "));
+        Serial.print(angleSetpoint, 1); Serial.print(F(" | "));
+        Serial.print(avgSpeed, 1); Serial.print(F(" | "));
+        Serial.print(stepsThisTick); Serial.print(F(" | "));
+        Serial.print(motorDir ? "FWD" : "REV"); Serial.print(F(" | "));
+        Serial.print(stepDelay); Serial.print(F(" | "));
+        Serial.println(balanceAngleOffset, 1);
+        lastPrint = millis();
+    }
+}
